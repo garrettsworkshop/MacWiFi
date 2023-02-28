@@ -9,19 +9,16 @@ typedef int size_t;
 #define NULL (0)
 #define TickCount() (0)
 #define noErr (0)
-#define openErr (-1)
+#define openErr (-23)
+#define paramErr (-50)
 
-typedef struct wificmdword_s {
+#define IRQDISABLE() {}; //FIXME
+#define IRQENABLE() {}; //FIXME
+
+typedef struct wificmd_s {
 	uint8_t id;
 	uint8_t arg0;
 	uint16_t arg1;
-} wificmdword_t;
-
-typedef struct wificmd_s {
-	wificmdword_t cmd;
-	Ptr txdata;
-	size_t txlength;
-	Ptr rxdata;
 } wificmd_t;
 
 #define WIFICMD_CANCEL			(0x0A)
@@ -36,38 +33,48 @@ typedef struct wificmd_s {
 #define WIFICMD_GET_FWVERSION	(0x01)
 #define WIFICMD_ECHO			(0x00)
 
-typedef struct wifiresult_s {
+typedef struct wifiresponse_s {
 	uint8_t code;
 	uint8_t value;
 	size_t length;
-} wifiresult_t;
+} wifiresponse_t;
 
-typedef enum wificmdphase_e {
+typedef enum wifitransferphase_e {
 	WIFIHAL_PHASE_IDLE = 0,
 	WIFIHAL_PHASE_TXDATA = 1,
 	WIFIHAL_PHASE_TXCMD = 2,
 	WIFIHAL_PHASE_RXRESULT = 3,
 	WIFIHAL_PHASE_RXDATA = 4
-} wificmdphase_t;
+} wifitransferphase_t;
+
+typedef struct wificmdentry_s {
+	wificmd_t cmd;
+	Ptr txdata;
+	size_t txlength;
+	Ptr rxdata;
+	size_t rxlength;
+	int done;
+	wifitransferphase_t phase;
+	wifiresponse_t result;
+	struct wificmdentry_s *next;
+} wificmdentry_t;
 
 typedef struct wifihal_s {
 	Ptr iobase;
-	wificmdphase_t phase;
-	wificmd_t cmd;
-	wifiresult_t result;
+	wificmdentry_t *cmd;
+	wificmdentry_t *last;
 } wifihal_t;
 
-#define WIFIHAL_ROMBASE			(0x80000)
-#define WIFIHAL_REG_RESPONSE	(0x00008)
-#define WIFIHAL_REG_PAYLOAD		(0x00004)
-#define WIFIHAL_REG_CMD			(0x00000)
-
+// Turns on ESP32 and gets ready to do wifi commands
 OSErr wifihal_open(wifihal_t *h, Ptr iobase);
 
-OSErr wifihal_cmd(wifihal_t *h, wificmd_t cmd);
+// Sends a command to WiFi card
+OSErr wifihal_cmd(wifihal_t *h, wificmdentry_t *cmd);
 
-OSErr wifihal_await(wifihal_t *h, wifiresult_t *result);
+// Waits for a command to complete
+OSErr wifihal_await(wificmdentry_t *h);
 
+// Turns off ESP32
 void wifihal_close(wifihal_t *h);
 
 #endif

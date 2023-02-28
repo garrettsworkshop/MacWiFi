@@ -1,77 +1,8 @@
 #include "wifihal.h"
+#include "wifireg.h"
 
-#define WIFIHAL_DT_TIMESLICE	(5)
-#define WIFIHAL_DT_MAXTRIES		(255)
-
-static inline int _wifihal_isopen(wifihal_t *h) {
-	return h->iobase != NULL;
-}
-
-static inline void _wifihal_espoff(wifihal_t *h) {
-	*(uint32_t*)(&h->iobase[WIFIHAL_ROMBASE]) = 0x00000000;
-}
-
-static inline void _wifihal_espon(wifihal_t *h) {
-	*(uint32_t*)(&h->iobase[WIFIHAL_ROMBASE]) = 0x00000001;
-}
-static inline void _wifihal_imask(wifihal_t *h) { _wifihal_espon(h); }
-
-static inline void _wifihal_wrie(wifihal_t *h) {
-	*(uint32_t*)(&h->iobase[WIFIHAL_ROMBASE]) = 0x00000002;
-}
-
-static inline void _wifihal_rdie(wifihal_t *h) {
-	*(uint32_t*)(&h->iobase[WIFIHAL_ROMBASE]) = 0x00000004;
-}
-
-static inline int _wifihal_wrreq(wifihal_t *h) {
-	return ((*(uint32_t*)(&h->iobase[WIFIHAL_ROMBASE])) >> 22) & 1;
-}
-
-static inline int _wifihal_rdreq(wifihal_t *h) {
-	return ((*(uint32_t*)(&h->iobase[WIFIHAL_ROMBASE])) >> 23) & 1;
-}
-
-static inline void _wifihal_tx4(wifihal_t *h, Ptr buf) {
-	*(uint32_t*)(&h->iobase[WIFIHAL_REG_PAYLOAD]) = *(uint32_t*)buf;
-}
-
-static inline void _wifihal_tx3(wifihal_t *h, Ptr buf) {
-	_wifihal_tx4(h, buf);
-}
-
-static inline void _wifihal_tx2(wifihal_t *h, Ptr buf) {
-	*(uint16_t*)(&h->iobase[WIFIHAL_REG_PAYLOAD]) = *(uint16_t*)buf;
-}
-
-static inline void _wifihal_tx1(wifihal_t *h, Ptr buf) {
-	*(uint8_t*)(&h->iobase[WIFIHAL_REG_PAYLOAD]) = *(uint8_t*)buf;
-}
-
-static inline void _wifihal_rx4(wifihal_t *h, Ptr buf) {
-	*(uint32_t*)buf = *(uint32_t*)(&h->iobase[WIFIHAL_REG_RESPONSE]);
-}
-
-static inline void _wifihal_txcmd(wifihal_t *h, wificmdword_t cmd) {
-	uint32_t temp;
-	temp = ((cmd.id & 0xFF)     << 24) |
-		   ((cmd.arg0 & 0xFF)   << 16) |
-		   ((cmd.arg1 & 0xFFFF) << 00);
-	_wifihal_tx4(h, (Ptr)&temp);
-}
-
-static inline void _wifihal_rx3(wifihal_t *h, Ptr buf) {
-	_wifihal_rx4(h, buf);
-}
-
-static inline void _wifihal_rx2(wifihal_t *h, Ptr buf) {
-	*(uint16_t*)buf = *(uint16_t*)(&h->iobase[WIFIHAL_REG_RESPONSE]);
-}
-
-static inline void _wifihal_rx1(wifihal_t *h, Ptr buf) {
-	*(uint8_t*)buf = *(uint8_t*)(&h->iobase[WIFIHAL_REG_RESPONSE]);
-}
-
+#define WIFIHAL_DT_TIMESLICE	(8)
+#define WIFIHAL_DT_MAXTRIES		(50)
 
 #define _WIFIHAL_DT_WAIT(condition) if (!condition) { \
 	uint32_t now; \
@@ -87,161 +18,182 @@ static inline void _wifihal_rx1(wifihal_t *h, Ptr buf) {
 
 // Sets IRQ masks correctly depending on transfer phase
 static void _wifihal_setphasemask(wifihal_t *h) {
-	switch (h->phase) {
-	case WIFIHAL_PHASE_IDLE:
-	_wifihal_imask(h); // Mask all IRQs
-	break;
 
+	IRQDISABLE(); // Critical section!
+
+	if (h->cmd == NULL) { _wifireg_imask(h); }
+
+	switch (h->cmd->phase) {
+	case WIFIHAL_PHASE_IDLE:
 	case WIFIHAL_PHASE_TXDATA:
 	case WIFIHAL_PHASE_TXCMD:
-	_wifihal_wrie(h); // Unmask only write request IRQ
+	_wifireg_wrie(h); // Unmask only write request IRQ
 	break;
 
 	case WIFIHAL_PHASE_RXRESULT:
 	case WIFIHAL_PHASE_RXDATA:
-	_wifihal_rdie(h); // Unmask only read request IRQ
+	_wifireg_rdie(h); // Unmask only read request IRQ
 	break;
 	}
+	
+	IRQENABLE();
 }
 
+// Deferred task function... accomplishes data transfer
 void _wifihal_dt(wifihal_t *h) {
-	uint32_t start = TickCount();
-	uint32_t end = start + WIFIHAL_DT_TIMESLICE;
-	int timeout1 = 0, timeout2 = 0;
+	// Compute when our timeslice ends
+	uint32_t end = TickCount() + WIFIHAL_DT_TIMESLICE;
+	int timeout1 = 0, timeout2 = 0; // These get set when timeout occurs
 
-	switch (h->phase) {
-	case WIFIHAL_PHASE_IDLE:
-	break;
+	while (h->cmd != NULL) { // While there are commands to be sent...
+		switch (h->cmd->phase) {
+			case WIFIHAL_PHASE_IDLE:
+			h->cmd->phase++;
 
-	case WIFIHAL_PHASE_TXDATA:
-	while (h->cmd.txlength > 3) { 
-		_WIFIHAL_DT_WAIT(_wifihal_wrreq(h));
-		// Send 4 bytes
-		_wifihal_tx4(h, h->cmd.txdata);
-		h->cmd.txdata += 4;
-		h->cmd.txlength -= 4;
-	}
-	_WIFIHAL_DT_WAIT(_wifihal_wrreq(h));
-	// Send remaining 1/2/3 bytes
-	switch (h->cmd.txlength) {
-		case 1: _wifihal_tx1(h, h->cmd.txdata); break;
-		case 2: _wifihal_tx2(h, h->cmd.txdata); break;
-		case 3: _wifihal_tx3(h, h->cmd.txdata); break;
-		default: break;
-	}
-	h->cmd.txdata += h->cmd.txlength;
-	h->cmd.txlength = 0;
-	h->phase++;
+			case WIFIHAL_PHASE_TXDATA:
+			while (h->cmd->txlength > 3) { 
+				_WIFIHAL_DT_WAIT(_wifireg_wrreq(h)); // Wait until write ready
+				_wifireg_tx4(h, h->cmd->txdata); // Send 4 bytes
+				h->cmd->txdata += 4; // Increase tx pointer by 4
+				h->cmd->txlength -= 4; // Decrease tx length by 4
+			}
+			_WIFIHAL_DT_WAIT(_wifireg_wrreq(h)); // Wait until write ready
+			switch (h->cmd->txlength) { // Send remaining 1/2/3 bytes
+				case 1: _wifireg_tx1(h, h->cmd->txdata); break;
+				case 2: _wifireg_tx2(h, h->cmd->txdata); break;
+				case 3: _wifireg_tx4(h, h->cmd->txdata); break;
+				default: break;
+			}
+			h->cmd->txdata += h->cmd->txlength; // Increase pointer past end
+			h->cmd->txlength = 0; // Zero rmaining tx length
+			h->cmd->phase++;
 
-	case WIFIHAL_PHASE_TXCMD:
-	_WIFIHAL_DT_WAIT(_wifihal_wrreq(h));
-	// Send command
-	_wifihal_txcmd(h, h->cmd.cmd);
-	h->phase++;
+			case WIFIHAL_PHASE_TXCMD:
+			_WIFIHAL_DT_WAIT(_wifireg_wrreq(h)); // Wait until write ready
+			_wifireg_txcmd(h, h->cmd->cmd); // Send command
+			h->cmd->phase++;
 
-	case WIFIHAL_PHASE_RXRESULT:
-	_WIFIHAL_DT_WAIT(_wifihal_rdreq(h));
-	// Receive result and store in h->result
-	uint32_t temp;
-	_wifihal_rx4(h, (Ptr)&temp);
-	h->result.code =   (temp >> 24) & 0xFF;
-	h->result.value =  (temp >> 16) & 0xFF;
-	h->result.length = (temp >> 00) & 0xFFFF;
-	// Store result length in h->cmd.txlength temporarily
-	h->cmd.txlength = h->result.length;
-	h->phase++;
+			case WIFIHAL_PHASE_RXRESULT:
+			_WIFIHAL_DT_WAIT(_wifireg_rdreq(h)); // Wait until read ready
+			// Receive result and store in h->cmd->result
+			uint32_t result;
+			_wifireg_rx4(h, (Ptr)&result);
+			h->cmd->result.code =   (result >> 24) & 0xFF;
+			h->cmd->result.value =  (result >> 16) & 0xFF;
+			h->cmd->result.length = (result >> 00) & 0xFFFF;
+			// Store result length in h->cmd->rxlength
+			h->cmd->rxlength = h->cmd->result.length;
+			h->cmd->phase++;
 
-	case WIFIHAL_PHASE_RXDATA:
-	while (h->cmd.txlength > 3) { 
-		_WIFIHAL_DT_WAIT(_wifihal_rdreq(h));
-		// Receive 4 bytes
-		_wifihal_rx4(h, h->cmd.rxdata);
-		h->cmd.rxdata += h->cmd.txlength;
-		h->cmd.txlength -= 4;
-	}
-	if (h->cmd.txlength > 0) {
-		_WIFIHAL_DT_WAIT(_wifihal_rdreq(h));
-		// Receive remaining 1/2/3 bytes
-		switch (h->cmd.txlength) {
-			case 1: _wifihal_rx1(h, h->cmd.rxdata); break;
-			case 2: _wifihal_rx2(h, h->cmd.rxdata); break;
-			case 3: _wifihal_rx3(h, h->cmd.rxdata); break;
-			default: break;
+			case WIFIHAL_PHASE_RXDATA:
+			while (h->cmd->rxlength > 3) { 
+				_WIFIHAL_DT_WAIT(_wifireg_rdreq(h)); // Wait until read ready
+				_wifireg_rx4(h, h->cmd->rxdata); // Receive 4 bytes
+				h->cmd->rxdata += 4; // Increase rx pointer by 4
+				h->cmd->rxlength -= 4; // Decrease rx length by 4
+			}
+			if (h->cmd->rxlength > 0) {
+				_WIFIHAL_DT_WAIT(_wifireg_rdreq(h)); // Wait until read ready
+				switch (h->cmd->rxlength) { // Receive remaining 1/2/3 bytes
+					case 1: _wifireg_rx1(h, h->cmd->rxdata); break;
+					case 2: _wifireg_rx2(h, h->cmd->rxdata); break;
+					case 3: _wifireg_rx4(h, h->cmd->rxdata); break;
+					default: break;
+				}
+				h->cmd->rxdata += h->cmd->rxlength; // Increase pointer past end
+				h->cmd->rxlength = 0; // Zero remaining rx length
+			}
+
+			// Set commmand done
+			h->cmd->phase = WIFIHAL_PHASE_IDLE;
+			h->cmd->done = 1;
+
+			h->cmd = h->cmd->next; // Advance to next position in linked list
+			// If no more commands set last to null
+			if (h->cmd == NULL) { h->last = NULL; }
 		}
-		_wifihal_rx4(h, h->cmd.rxdata);
-		h->cmd.rxdata += h->cmd.txlength;
-		h->cmd.txlength = 0;
-	}
-	h->phase = WIFIHAL_PHASE_IDLE;
 	}
 
-	if (timeout1 || timeout2) { _wifihal_imask(h); }
+	// If we timed out, disable interrupts until next vblank
+	if (timeout1 || timeout2) { _wifireg_imask(h); }
+	// Otherwise set the interrupt mask correctly depending on current phase
 	else { _wifihal_setphasemask(h); }
 
 	return;
 }
 
+// WiFi card data transfer interrupt handler
 void _wifihal_isr(wifihal_t *h) {
 	//TODO: Install deferred task
-	_wifihal_imask(h); // Mask all IRQs
+	_wifireg_imask(h); // Mask all IRQs
 	// Return causes control to be transferred to _wifihal_dt(...)
 }
 
+// Vertical blanking interrupt handler
 void _wifihal_vbl(wifihal_t *h) {
 	_wifihal_setphasemask(h);
 }
 
-
-OSErr wifihal_await(wifihal_t *h, wifiresult_t *result) {
-	if (h == NULL || !_wifihal_isopen(h)) { return -1/*FIXME*/; }
-
-	while (h->phase != WIFIHAL_PHASE_IDLE);
-	if (result != NULL) { *result = h->result; }
+// Waits for a command to complete
+OSErr wifihal_await(wificmdentry_t *cmd) {
+	if (cmd == NULL) { return paramErr; }
+	while (!cmd->done);
 	return noErr;
 }
 
-OSErr wifihal_cmd(wifihal_t *h, wificmd_t cmd) {
-	if (h == NULL || !_wifihal_isopen(h)) { return -1/*FIXME*/; }
+// Sends a command to WiFi card
+OSErr wifihal_cmd(wifihal_t *h, wificmdentry_t *cmd) {
+	if (h == NULL || !_wifihal_isopen(h)) { return paramErr; }
 
-	wifihal_await(h, NULL); // Wait for previous command to finish
+	cmd->done = 0; // Set not done
+	cmd->phase = WIFIHAL_PHASE_IDLE; // Initial phase
+	cmd->result = (wifiresponse_t){0}; // Zero resu;t
+	cmd->next = NULL; // Null next pointer
 
-	h->cmd = cmd; // Store command
-	h->phase = WIFIHAL_PHASE_TXDATA; // Set phase
+	IRQDISABLE(); // Critical section!
+	if (h->cmd == NULL) { // If no current command...
+		h->cmd = cmd; // Set current command to incoming one
+		_wifireg_wrie(h); // Unmask only write request IRQ
+	}
+	else { h->last->next = cmd; } // Otherwise add to end of linked list
+	h->last = cmd; // Update end pointer
+	IRQENABLE();
 
-	_wifihal_wrie(h); // Unmask only write request IRQ
 	return noErr;
 }
 
+// Turns on ESP32 and gets ready to do wifi commands
 OSErr wifihal_open(wifihal_t *h, Ptr iobase) {
 	if (h == NULL || iobase == NULL || _wifihal_isopen(h)) { return openErr; }
 
-	*h = (wifihal_t){0};
-	h->phase = WIFIHAL_PHASE_IDLE; // Go to idle phase
-	h->iobase = iobase;
+	*h = (wifihal_t){0}; // Zero the wifihal entry
+	h->cmd = NULL;
+	h->iobase = iobase; // Save iobase pointer
 
-	_wifihal_espon(h); // Enable ESP32
+	_wifireg_espon(h); // Enable ESP32
 
 	//TODO: Install card interrupt handler
 	//TODO: Install VBL interrupt handler
 
 	// Send GET_FWVERSION command so as to defer until ESP32 booted
-	wificmd_t cmd = {
+	wificmdentry_t cmd = {
 		.cmd = {
 			.id = WIFICMD_GET_FWVERSION,
 			.arg0 = 0,
 			.arg1 = 0
 		},
 		.txdata = NULL,
-		.txlength = 0,
 		.rxdata = NULL
 	};
-	wifihal_cmd(h, cmd);
+	wifihal_cmd(h, &cmd);
+
 	return noErr;
 }
 
+// Turns off ESP32
 void wifihal_close(wifihal_t *h) {
 	if (h == NULL) { return; }
-	wifihal_await(h, NULL); // Wait for previous command to finish
+	while (h->cmd != NULL); // Wait for previous command to finish
 	h->iobase = NULL;
-	_wifihal_espoff(h);
+	_wifireg_espoff(h);
 }
